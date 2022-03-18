@@ -1,0 +1,575 @@
+---
+title: 'CBER Species distribution model'
+author: Vivienne Groner
+date: "Last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+  
+```{r include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+```
+The code below demonstrates how to download and preprocess occurrence data from GBIF, download CHELSA climate data, and run a basic species distribution model. The code was written for South Africa (see reference Ferguson-Gow, Groner, Williams et al.) but can be adjusted to any other study area.
+For a more detailed introduction to species distribution models in R, go to [SDM Introduction](https://rspatial.org/raster/sdm/1_sdm_introduction.html).
+
+# Set up your working environment
+### Libraries
+```{r Libraries}
+set.seed(2237)
+library(CoordinateCleaner)
+library(dplyr)
+library(lwgeom)
+library(raster)
+library(sp)
+library(readr)
+library(sf)
+library(dismo)
+library(rgdal)  
+library(stringr)
+library(vroom)
+library(ggplot2)
+```
+
+
+### Sourcing and directories
+Set the directories to your project folder, the climate data and the SA_functions_CBER.R file (see SA_functions_CBER_markdown.html). The lower level folder structure for evaluation files, current and future projections, and figures will be created throughout the process.
+
+```{r Sourcing and directories, results='hide'}
+base_dir_in<-"Y:/SHEFS_joint_project/05_code_vivienne/pipeline_for_pc/my_experiment/"
+climate_path<-paste0(base_dir_in,"CHELSA/")
+
+source(paste0(base_dir_in,"/SA_functions_CBER.R"))
+memory.limit(size=500000000)
+
+```
+# PART 1 - preprocessing of occurrence data
+
+### Select study area
+Make sure to select a study area that is big enough to capture the full range of the species you consider at current and future climate. If you are not sure, you can start by looking at the current distribution on the GBIF website or IUCN website and add around 10 % to the current range.
+```{r Select species and study area}
+xmin <- 15
+xmax <- 35
+ymin <- -35
+ymax <- -20
+
+ext_occ <- raster::extent(xmin, xmax, ymin, ymax)
+
+```
+
+### Load species occurrences points from GBIF
+In this section, the gbifData function loads occurrence records for all species in your list. Check the [GBIF guidelines](https://www.gbif.org/citation-guidelines) for correct citation.
+```{r Load species occurrences points from GBIF}
+if(!dir.exists(paste0(base_dir_in, "points/raw"))){
+  dir.create(paste0(base_dir_in, "/points/raw/"), recursive = TRUE)
+}
+
+sp_names <- c('Amietia_delalandii','Certhilauda_subcoronata')
+min_occ <-  20 # minimum number of occurrence points needed for the species to be included in the models
+
+spxy_out <- lapply(X = sp_names, 
+                   FUN = gbifData,  
+                   ext_occ = ext_occ, 
+                   out_dir = paste0(base_dir_in, "/points/raw/"), 
+                   min_occ = min_occ)
+
+```
+
+
+### Load reference climate data
+This section downloads bioclimatic variables (climatologies, typically 1979-2013) from [CHELSA](https://chelsa-climate.org/) or reads data that you have already selected for your species and downloaded. For more information on bioclimatic variables see [WorldClim](https://www.worldclim.org/data/bioclim.html).
+```{r Load reference climate data}
+bioclim_layers <- c(1, 5, 6, 13, 14) #the number of the bioclim layers to be included as environmental variables
+# download climate layers
+bio_layers1<-chelsa_bioclim_get(bioclim_layers)
+# alternatively, you can read them directly from storage 
+# bio_layers <- list.files(climate_path, pattern = 'tif')
+# bio_layers1<-paste(climate_path, bio_layers, sep="/")
+bio_layers2 <-lapply(bio_layers1,raster::raster)
+env_layers <- raster::stack(bio_layers2)
+env_crop <- raster::crop(env_layers, ext_occ)
+
+```
+
+
+### Clean occurrence points
+This step removes occurrence records that are errors, for example points in the ocean, duplicates, and so on (check [CoordinateCleaner](https://www.rdocumentation.org/packages/CoordinateCleaner/versions/2.0-20) for details on the package).
+```{r Clean occurrence points}
+if(!dir.exists(paste0(base_dir_in,"/points/cleaned_raw"))){
+  dir.create(paste0(base_dir_in,"/points/cleaned_raw/"))
+}
+
+sp_names <- gsub(".csv", "", list.files(paste0(base_dir_in,"/points/raw/")))
+
+lapply(X = sp_names, 
+       FUN = cc_wrapper, 
+       in_dir = paste0(base_dir_in,"/points/raw/"), 
+       out_dir = paste0(base_dir_in,"/points/cleaned_raw/"), 
+       min_occ = min_occ)
+
+```
+
+### Rarefy occurrence points
+This step makes sure that there is only one occurrence record per grid cell. The model can only account for one point per grid cell and you might end up with less unique points than total occurrence.
+```{r Rarefy occurrence points so there is only one in each grid cell}
+if(!dir.exists(paste0(base_dir_in,"/points/rarefied",sep=''))){
+  dir.create(paste0(base_dir_in,"/points/rarefied/",sep=''))
+}
+
+ref_map <- env_crop[[1]]
+ref_map[!is.na(ref_map)] <- 0   #ref_map should be full of non-1 values
+
+sp_names <- gsub(".csv", "", list.files(paste0(base_dir_in,"/points/cleaned_raw/"),pattern='csv'))
+
+lapply(X = sp_names, 
+       FUN = rarefyPoints,
+       in_dir = paste0(base_dir_in,"/points/cleaned_raw/"), 
+       out_dir = paste0(base_dir_in,"/points/rarefied/"), 
+       ref_map = ref_map, 
+       min_occ = min_occ)
+
+```
+
+### Extract the environmental data for each occurrence point
+This step extracts bioclimatic data at all locations where occurrences were recorded.
+```{r Extract the environmental data for each occurrence point}
+if(!dir.exists(paste0(base_dir_in,"/environmental/presence/"))){
+  dir.create(paste0(base_dir_in,"/environmental/presence/"), recursive = TRUE)
+}
+
+sp_names <- gsub(".csv", "", list.files(paste0(base_dir_in,"/points/rarefied/"),pattern='csv'))
+
+lapply(X= sp_names, 
+       FUN = ras_extract,
+       in_dir = paste0(base_dir_in,"/points/rarefied/"), 
+       out_dir = paste0(base_dir_in,"/environmental/presence/"), 
+       raster_in = env_crop)
+
+```
+
+### Background Data - create background and pseudoabsence points
+This part selects background points and pseudoabsences from the same ecoregions as the species occurrence records. Background data are not attempting to guess at absence locations, but rather to characterize environments in the study region. A closely related but different concept, that of “pseudo-absences”, is also used for generating the non-presence class for logistic models. In this case, researchers sometimes try to guess where absences might occur – they may sample the whole region except at presence locations, or they might sample at places unlikely to be suitable for the species. 
+```{r Create background and pseudoabsence points}
+if(!dir.exists(paste0(base_dir_in,"/points/background/"))){
+  dir.create(paste0(base_dir_in,"/points/background/"))
+}
+
+if(!dir.exists(paste0(base_dir_in,"/points/pseudoabsence/"))){
+  dir.create(paste0(base_dir_in,"/points/pseudoabsence/"))
+}
+
+# If you haven't downloaded WWF ecoregions 
+#load_ecoreg<-wwf_ecoregions_get()
+# else
+ecoreg <-
+  sf::st_read(paste0(base_dir_in,"/WWF_Ecoregions/wwf_terr_ecos.shp")) %>% 
+  sf::st_crop(.,ext_occ) %>%  ##cropping to the area of interest
+  dplyr::select(OBJECTID, ECO_NAME) ##just selecting out the columns we're interested in
+
+  lapply(X = sp_names, 
+         background_sampler, 
+         in_dir = paste0(base_dir_in,"/points/rarefied/"), 
+         out_dir = paste0(base_dir_in,"/points/background/"), 
+         dens_abs = "density", density = 100, type = "background",  
+         polygon = ecoreg)
+  
+  lapply(X = sp_names, 
+         background_sampler, 
+         in_dir = paste0(base_dir_in,"/points/rarefied/"), 
+         out_dir = paste0(base_dir_in,"/points/pseudoabsence/"), 
+         dens_abs = "density", density = 250, type = "pseudoabsence", buffer = 25, # you can play with the buffer
+         polygon = ecoreg)
+  
+```
+
+## Extract environmental data for background points and pseudoabsences
+This step extracts bioclimatic data at the locations of background points and pseudoabsences.
+```{r Extract environmental data for background points and pseudoabsences}
+ if(!dir.exists(paste0(base_dir_in,"/environmental/background/"))){
+   dir.create(paste0(base_dir_in,"/environmental/background/"))
+ }
+
+if(!dir.exists(paste0(base_dir_in,"/environmental/pseudoabsence/"))){
+  dir.create(paste0(base_dir_in,"/environmental/pseudoabsence/"))
+}
+ 
+ lapply(X= sp_names, 
+        FUN = ras_extract,
+        in_dir = paste0(base_dir_in,"/points/background/"), 
+        out_dir = paste0(base_dir_in,"/environmental/background/",sep=''), 
+        raster_in = env_crop)
+ 
+ lapply(X= sp_names, 
+        FUN = ras_extract,
+        in_dir = paste0(base_dir_in,"/points/pseudoabsence/",sep=''), 
+        out_dir = paste0(base_dir_in,"/environmental/pseudoabsence/",sep=''), 
+        raster_in = env_crop)
+```
+## Plot occurrence points on map
+```{r Plot occurrence points on map}
+
+if(!dir.exists(paste0(base_dir_in,"/plot_points/"))){
+  dir.create(paste0(base_dir_in,"/plot_points/"))
+}
+
+points_in_list<-list.files(paste0(base_dir_in,"environmental/presence/"),pattern = "*.csv", full.names = TRUE)
+points_in<-lapply(points_in_list,read.csv)
+
+for (i in 1:length(points_in)){
+  #tiff(paste0(base_dir_in,"/plot_points/", sp_names[[i]], ".png")) # this part saves the plot
+  plot(ref_map,legend = FALSE, main=paste('occurrence - ', sp_names[[i]]),xlab="longitude", ylab="latitude",col='grey')
+  box()
+  points(points_in[[i]]$x,points_in[[i]]$y,pch=16)  
+  #dev.off()
+
+}
+```
+
+
+# PART 2 - Species distribution model
+
+## Load and prepare future climate data
+This example includes two climate scenarios (RCP4.5 and RCP 8.5) from five General circulation models. The models were selected because they represent the South African climate well and are different in their structure. For more information on model selection see [CHELSA future](https://chelsa-climate.org/future/) .
+If you don't have access to this data set, you can download it from the CHELSA 'envicloud' using [wget](https://www.gnu.org/software/wget/). Select all files that you want to download. Download the file (envidatS3paths.txt), install wget and then run the command: wget --no-host-directories --force-directories --input-file=envidatS3paths.txt. 
+```{r Load and prepare future climate data}
+climate_path_future<-c(paste(base_dir_in,'CHELSA_future/2061-2080/rcp45/ACCESS1-0/',sep=''), # you can select your own future scenarios
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp45/CNRM-CM5/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp45/GFDL-ESM2G/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp45/HadGEM2-CC/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp45/MPI-ESM-MR/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp85/ACCESS1-0/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp85/CNRM-CM5/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp85/GFDL-ESM2G/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp85/HadGEM2-CC/',sep=''),
+                        paste(base_dir_in,'CHELSA_future/2061-2080/rcp85/MPI-ESM-MR/',sep='')
+)
+
+climate_scen_name<-c('rcp45_ACCESS1-0')#,'rcp45_CNRM-CM5','rcp45_GFDL-ESM2G','rcp45_HadGEM2-CC','rcp45_MPI-ESM-MR',
+                     #'rcp85_ACCESS1-0','rcp85_CNRM-CM5','rcp85_GFDL-ESM2G','rcp85_HadGEM2-CC','rcp85_MPI-ESM-MR')
+
+env_crop_future<-list()
+for (fut in 1:length(climate_scen_name)){
+  
+  bio_layers_future <- list.files(climate_path_future[[fut]], pattern = 'tif')
+  bio_layers1_future<-paste0(climate_path_future[[fut]], bio_layers_future) 
+  bio_layers2_future <-lapply(bio_layers1_future,raster)
+  env_layers_future <- raster::stack(bio_layers2_future)
+  env_crop_future[[fut]] <- raster::crop(env_layers_future, ext_occ)
+  names(env_crop_future[[fut]])<-c('CHELSA_bio10_01','CHELSA_bio10_13','CHELSA_bio10_14','CHELSA_bio10_05','CHELSA_bio10_06') #check order
+}
+```
+## Create folders for predictions and evaluation
+```{r Create folders for predictions and evaluation}
+  
+  if(!dir.exists(paste0(base_dir_in,"predictions/bioclim/"))){
+    dir.create(paste0(base_dir_in,"predictions/bioclim"), recursive = TRUE)
+  }
+
+  if(!dir.exists(paste0(base_dir_in,"predictions/glm/"))){
+    dir.create(paste0(base_dir_in,"predictions/glm"), recursive = TRUE)
+  }
+
+  if(!dir.exists(paste0(base_dir_in,"predictions/rf/"))){
+    dir.create(paste0(base_dir_in,"predictions/rf"), recursive = TRUE)
+  }
+
+  if(!dir.exists(paste0(base_dir_in,"evaluation/bioclim/"))){
+    dir.create(paste0(base_dir_in,"evaluation/bioclim"), recursive = TRUE)
+  }
+
+  if(!dir.exists(paste0(base_dir_in,"evaluation/glm/"))){
+    dir.create(paste0(base_dir_in,"evaluation/glm"), recursive = TRUE)
+  }
+
+  if(!dir.exists(paste0(base_dir_in,"evaluation/rf/"))){
+    dir.create(paste0(base_dir_in,"evaluation/rf"), recursive = TRUE)
+  }
+
+
+  for (fut in 1:length(climate_scen_name)){
+    if(!dir.exists(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/bioclim/"))){
+      dir.create(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/bioclim/"), recursive = TRUE)
+    }
+  
+    if(!dir.exists(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/glm/"))){
+      dir.create(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/glm/"), recursive = TRUE)
+    }
+  
+    if(!dir.exists(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/rf/"))){
+      dir.create(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/rf/"), recursive = TRUE)
+    }
+  }
+
+```
+
+## Fit Bioclim Models
+```{r Fit Bioclim Models}
+  # present
+  lapply(
+    X = sp_names,
+    fitBC,
+    pres_dir = paste0(base_dir_in,"environmental/presence/"),
+    backg_dir = paste0(base_dir_in, "environmental/pseudoabsence/"),
+    predictor_names = bioclim_layers,
+    predictors = env_crop,
+    pred_out_dir = paste0(base_dir_in,"predictions/bioclim/"),
+    eval_out_dir = paste0(base_dir_in,"evaluation/bioclim/"),
+    overwrite = TRUE,
+    threads = 4,
+    eval = TRUE
+  )
+
+  # future
+  for (fut in 1:length(climate_scen_name)){
+  lapply(
+    X = sp_names,
+    fitBC_future,
+    pres_dir = paste0(base_dir_in,"environmental/presence/"),
+    backg_dir = paste0(base_dir_in, "environmental/pseudoabsence/"),
+    predictor_names = bioclim_layers,
+    predictors_future = env_crop_future[[fut]],
+    pred_out_dir_future = paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/bioclim/"),
+    eval_out_dir = paste0(base_dir_in,"evaluation/bioclim/"),
+    overwrite = TRUE,
+    threads = 4,
+    eval = TRUE
+  )
+  }
+
+
+```
+## Fit GLM Models
+```{r Fit GLM Models}
+  # present
+  lapply(
+    X = sp_names,
+    fitGLM,
+    pres_dir = paste0(base_dir_in,"environmental/presence/"),
+    backg_dir = paste0(base_dir_in, "environmental/pseudoabsence/"),
+    predictor_names = bioclim_layers,   #need to think about which ones we want to include
+    predictors = env_crop,
+    pred_out_dir =  paste0(base_dir_in,"predictions/glm/"),
+    eval_out_dir =  paste0(base_dir_in,"evaluation/glm/"),
+    overwrite = TRUE,
+    threads = 4,
+    eval = TRUE
+  )
+
+  # future
+  for (fut in 1:length(climate_scen_name)){
+  lapply(
+    X = sp_names,
+    fitGLM_future,
+    pres_dir = paste0(base_dir_in,"environmental/presence/"),
+    backg_dir = paste0(base_dir_in, "environmental/pseudoabsence/"),
+    predictor_names = bioclim_layers,   #need to think about which ones we want to include
+    predictors_future = env_crop_future[[fut]],
+    pred_out_dir_future = paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/glm/"),
+    eval_out_dir =  paste0(base_dir_in,"evaluation/glm/"),
+    overwrite = TRUE,
+    threads = 4,
+    eval = TRUE
+    )
+  }
+
+```
+
+## Fit Random Forest Models
+```{r Fit Random Forest Models}
+  # present
+  lapply(
+  X = sp_names,
+  fitRF,
+  pres_dir =  paste0(base_dir_in,"environmental/presence/"),
+  backg_dir =  paste0(base_dir_in,"environmental/pseudoabsence/"),
+  predictor_names = bioclim_layers,
+  predictors = env_crop,
+  pred_out_dir =  paste0(base_dir_in,"predictions/rf/"),
+  eval_out_dir =  paste0(base_dir_in,"evaluation/rf/"),
+  overwrite = TRUE,
+  threads = 4,
+  eval = TRUE
+  )
+
+  # future
+  for (fut in 1:length(climate_scen_name)){
+    lapply(
+      X = sp_names,
+      fitRF_future,
+      pres_dir =  paste0(base_dir_in,"environmental/presence/"),
+      backg_dir =  paste0(base_dir_in,"environmental/pseudoabsence/"),
+      predictor_names = bioclim_layers,
+      predictors_future = env_crop_future[[fut]],
+      pred_out_dir_future = paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/rf/"),
+      eval_out_dir =  paste0(base_dir_in,"evaluation/rf/"),
+      overwrite = TRUE,
+      threads = 4,
+      eval = TRUE
+      )  
+  }
+
+```
+##Create directories for ensemble model output
+```{r Create directories for ensemble model output}
+if(!dir.exists( paste0(base_dir_in,"predictions/ensemble/majority_pa"))){
+  dir.create(paste0(base_dir_in,"predictions/ensemble/majority_pa"), recursive = TRUE)
+}
+
+if(!dir.exists( paste0(base_dir_in,"predictions/ensemble/weighted"))){
+  dir.create(paste0(base_dir_in,"predictions/ensemble/weighted"), recursive = TRUE)
+}
+
+
+for (fut in 1:length(climate_scen_name)){
+  
+  if(!dir.exists( paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/ensemble/majority_pa"))){
+    dir.create(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/ensemble/majority_pa"), recursive = TRUE)
+  }
+  
+  if(!dir.exists( paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/ensemble/weighted"))){
+    dir.create(paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/ensemble/weighted"), recursive = TRUE)
+  }
+  
+}
+
+```
+## Get evaluation and AUCs for ensemble model
+This part reads the evaluation files from the different algorithms and run an ensemble model. You can select the threshold and calculate the presence absence by majority or weighted by AUC. You can select from the following thresholds:
+
+* kappa: the threshold at which kappa is highest ("max kappa")
+* spec_sens: the threshold at which the sum of the sensitivity (true positive rate) and specificity (true negative rate) is highest
+* no_omission: the highest threshold at which there is no omission
+* prevalence: modeled prevalence is closest to observed prevalence
+* equal_sens_spec: equal sensitivity and specificity
+* sensitivity: fixed (specified) sensitivity
+
+```{r Get evaluation and AUCs for ensemble model}
+eval_files <-
+  list.files(
+  paste0(base_dir_in,"evaluation"),
+  full.names = TRUE,
+  recursive = TRUE,
+  pattern = c("*eval"))
+
+for (s in 1:length(sp_names)){
+
+  eval_files1<-grep(eval_files,pattern=sp_names[[s]],value=TRUE)
+  evals_out <- lapply(eval_files1, get_eval, threshold = "spec_sens") # select threshold here
+  eval_df <- do.call(rbind, evals_out)
+  eval_df$sp_name <- as.character(eval_df$sp_name)
+
+  preds <- list.files(paste0(base_dir_in,"predictions"),pattern=sp_names[[s]], full.names = TRUE, recursive = TRUE)
+  preds <- preds[!grepl("/ensemble/", preds)]
+
+  ensemble_model(sp_names[[s]], 
+                 eval_df = eval_df, 
+                 preds = preds, 
+                 out_dir = paste0(base_dir_in,"predictions/ensemble/"), 
+                 method = "majority_pa")
+  
+  ensemble_model(sp_names[[s]], 
+                 eval_df = eval_df, 
+                 preds = preds, 
+                 out_dir = paste0(base_dir_in,"predictions/ensemble/"), 
+                 method = "weighted")
+
+# future 
+  for (fut in 1:length(climate_scen_name)){
+    
+    predsf <- list.files(paste0(base_dir_in, "future/",climate_scen_name[[fut]],"/predictions"),
+                         pattern=sp_names[[s]], full.names = TRUE, recursive = TRUE)
+    predsf <- predsf[!grepl("/ensemble/", predsf)]
+
+    ensemble_model_f(sp_names[[s]], 
+                     eval_df = eval_df, 
+                     preds = predsf, 
+                     out_dir = paste0(base_dir_in, "future/", climate_scen_name[[fut]], "/predictions/ensemble/"), 
+                     method = "majority_pa")
+    
+    ensemble_model_f(sp_names[[s]], 
+                     eval_df = eval_df, 
+                     preds = predsf, 
+                     out_dir = paste0(base_dir_in, "future/", climate_scen_name[[fut]], "/predictions/ensemble/"), 
+                     method = "weighted")
+
+  }  
+}
+
+
+```
+
+## Create plots
+This part creates a simple plot of a presence absence map and occurrence records. The plots are saved as jpeg files, below one example of the format for illustration.
+```{r Create plots}
+if(!dir.exists(paste0(base_dir_in, "plots/ensemble/majority_pa"))){
+  dir.create(paste0(base_dir_in, "plots/ensemble/majority_pa"), recursive = TRUE)
+}
+
+if(!dir.exists(paste0(base_dir_in, "plots/ensemble/weighted"))){
+  dir.create(paste0(base_dir_in, "plots/ensemble/weighted"), recursive = TRUE)
+}
+
+for ( fut in 1:length(climate_scen_name)){
+  
+  if(!dir.exists(paste0(base_dir_in, "plots/future/ensemble/majority_pa"))){
+    dir.create(paste0(base_dir_in, "plots/future/ensemble/majority_pa"), recursive = TRUE)
+  }
+  
+    if(!dir.exists(paste0(base_dir_in, "plots/future/ensemble/weighted"))){
+    dir.create(paste0(base_dir_in, "plots/future/ensemble/weighted"), recursive = TRUE)
+    }
+  
+}
+
+lapply(FUN=ggplot_out, 
+      X = sp_names, 
+      points_dir = paste0(base_dir_in, "points/rarefied/"), 
+      rast_dir = paste0(base_dir_in,"predictions/ensemble/majority_pa/"), 
+      out_dir = paste0(base_dir_in, "plots/ensemble/majority_pa/"))
+
+lapply(FUN=ggplot_out, 
+      X = sp_names, 
+      points_dir = paste0(base_dir_in, "points/rarefied/"), 
+      rast_dir = paste0(base_dir_in,"predictions/ensemble/weighted/"), 
+      out_dir = paste0(base_dir_in, "plots/ensemble/weighted/"))
+
+for (fut in 1:length(climate_scen_name)){
+  
+  lapply(FUN=ggplot_outf, 
+        X = sp_names, 
+        points_dir = paste0(base_dir_in, "points/rarefied/"), 
+        rast_dir = paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/ensemble/majority_pa/"), 
+        out_dir = paste0(base_dir_in, "plots/future/ensemble/majority_pa/"))
+
+  lapply(FUN=ggplot_outf, 
+        X = sp_names,
+        points_dir = paste0(base_dir_in, "points/rarefied/"), 
+        rast_dir = paste0(base_dir_in,"future/",climate_scen_name[[fut]],"/predictions/ensemble/weighted/"), 
+        out_dir = paste0(base_dir_in, "plots/future/ensemble/weighted/"))
+
+}
+```
+Plot for illustration:
+```{r plot for illustration}
+
+# for illustration
+  points <- read.csv(paste0(base_dir_in, "points/rarefied/",sp_names[[1]],".csv"))
+  ras <- raster(paste0(base_dir_in,"predictions/ensemble/majority_pa/",  sp_names[[1]], "_ensemble.tif"))
+  
+  ras.p <-  rasterToPoints(ras)
+  df <- data.frame(ras.p)
+  colnames(df) <- c("Longitude", "Latitude", "Prob")
+  
+  ggplot(df, aes(y = Latitude, x = Longitude))+
+    geom_tile(aes(fill = Prob))+
+    geom_point(data = points, aes(x = x, y = y), colour = "red", shape = 4)+
+    coord_equal()+
+    theme_bw()+
+    ggtitle(paste0(sp_names[[1]],' under current climate'))
+
+```
+
+END
+
+
+
+
